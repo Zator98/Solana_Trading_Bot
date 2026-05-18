@@ -367,9 +367,11 @@ const JUP_SWAP      = 'https://quote-api.jup.ag/v6/swap';
 const JUP_QUOTE_ALT = 'https://lite-api.jup.ag/swap/v1/quote';
 const JUP_SWAP_ALT  = 'https://lite-api.jup.ag/swap/v1/swap';
 
-// FIXED: Use Birdeye API for newer tokens instead of DexScreener
+// FIXED: Use Birdeye API for newer tokens + CORS proxy fallback
 const BIRDEYE_LIST  = 'https://public-api.birdeye.so/token/new_tokens?sort_type=created_time&sort_order=desc&limit=20&offset=0';
 const BIRDEYE_PAIR  = 'https://public-api.birdeye.so/defi/price?address=';
+const CORS_PROXY    = 'https://api.allorigins.win/raw?url=';
+const COINGECKO_API = 'https://api.coingecko.com/api/v3/simple/token_price/solana?ids='; // CORS-friendly
 
 const G = {
     wallet: null, walletName: '', walletAddress: null,
@@ -455,7 +457,7 @@ async function tickLatency() {
     } catch(_){}
 }
 
-// ── FIXED FETCH WITH TIMEOUT ─────────────────────────────────
+// ── FIXED FETCH WITH TIMEOUT AND CORS PROXY ─────────────────
 async function fetchWithTimeout(url, opts={}) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
@@ -467,6 +469,25 @@ async function fetchWithTimeout(url, opts={}) {
     } catch(e) {
         clearTimeout(timeout);
         throw e;
+    }
+}
+
+// CORS-safe fetch with proxy fallback for external APIs
+async function fetchCORSSafe(url, opts={}) {
+    try {
+        // Try direct fetch first
+        const r = await fetchWithTimeout(url, {...opts, headers: {'Accept': 'application/json', ...opts.headers}});
+        return r;
+    } catch(directErr) {
+        // If CORS blocked, try proxy
+        try {
+            log('Direct fetch blocked, using CORS proxy…','warning');
+            const proxied = CORS_PROXY + encodeURIComponent(url);
+            const r = await fetchWithTimeout(proxied, opts);
+            return r;
+        } catch(proxyErr) {
+            throw new Error(`Both direct and proxy failed: ${directErr.message}`);
+        }
     }
 }
 
@@ -683,33 +704,47 @@ async function doSwap(quoteResp) {
     } catch(e) { log('❌ Swap error: '+e.message,'error'); return null; }
 }
 
-// ── FIXED TOKEN SCANNER WITH BIRDEYE ─────────────────────────
+// ── FIXED TOKEN SCANNER WITH BIRDEYE + FALLBACK ─────────────
 async function startScan() {
-    log('🔍 Token scanner started (using Birdeye)…','info');
+    log('🔍 Token scanner started (Birdeye with CORS proxy fallback)…','info');
     const poll = async () => {
         if(G.status!=='running') return;
         try {
-            const r = await fetchWithTimeout(BIRDEYE_LIST, {headers:{accept:'application/json'}});
-            if(!r.ok) { log('Birdeye unavailable, retrying…','warning'); return; }
+            const r = await fetchCORSSafe(BIRDEYE_LIST);
+            if(!r.ok) { log('⚠ Birdeye unavailable, retrying…','warning'); return; }
             const data = await r.json();
             const items = (data?.data || []).slice(0,15);
             
-            log(`Found ${items.length} new tokens scanning…`,'info');
+            log(`🔍 Scanning: found ${items.length} tokens`, items.length > 0 ? 'success' : 'warning');
             
             for(const t of items) {
                 const addr = t.address || t.mint;
                 if(!addr || G.tokens.find(x=>x.address===addr)) continue;
                 
+                // Fetch price with fallback
+                let priceUsd = t.price || 0;
+                if(!priceUsd) {
+                    try {
+                        const pr = await fetchWithTimeout(BIRDEYE_PAIR + addr, {headers:{accept:'application/json'}});
+                        if(pr.ok) {
+                            const pd = await pr.json();
+                            priceUsd = pd?.data?.value || 0;
+                        }
+                    } catch(_) {
+                        // Price fetch failed, use whatever we have
+                    }
+                }
+                
                 const tok = {
-                    symbol: t.symbol || '???',
+                    symbol: (t.symbol || '???').slice(0,14),
                     name: t.name || '',
                     address: addr,
                     age: t.createTime ? (Date.now() - t.createTime*1000)/60000 : 0,
-                    liquidity: t.liquidity || 0,
-                    mcap: t.mc || 0,
-                    volume5m: t.v5m || 0,
-                    avgVolume1m: t.v1h || 0,
-                    priceUsd: t.price || 0,
+                    liquidity: parseFloat(t.liquidity || 0),
+                    mcap: parseFloat(t.mc || 0),
+                    volume5m: parseFloat(t.v5m || 0),
+                    avgVolume1m: parseFloat(t.v1h || 0),
+                    priceUsd: priceUsd,
                     topHolderPercent: 0,
                     mintAuthority: false,
                     bondingCurveProgress: 0,
@@ -722,10 +757,10 @@ async function startScan() {
                 if(G.status==='running') evalEntry(tok);
             }
             renderFeed();
-        } catch(e){ log('⚠ Scan error: '+e.message,'warning'); }
+        } catch(e){ log('❌ Scan error: '+e.message,'error'); }
     };
     poll();
-    G.scanIv=setInterval(poll,10000); // 10s interval to avoid rate limits
+    G.scanIv=setInterval(poll,12000); // 12s interval
 }
 
 // ── ENTRY EVALUATION (RELAXED) ──────────────────────────────
@@ -818,10 +853,10 @@ async function closePosAt(idx, reason, overPx) {
 async function refreshPrices() {
     for(const pos of G.openPositions) {
         try {
-            const r=await fetchWithTimeout(BIRDEYE_PAIR+pos.tokenAddress,{headers:{accept:'application/json'}});
+            const r = await fetchCORSSafe(BIRDEYE_PAIR+pos.tokenAddress, {headers:{accept:'application/json'}});
             if(!r.ok) continue;
-            const d=await r.json();
-            const p=d?.data?.value;
+            const d = await r.json();
+            const p = d?.data?.value;
             if(p&&p>0){ pos.currentPrice=p; pos.unrealizedPnl=(p-pos.entryPriceUsd)*(pos.tokenAmount/1e9); }
         } catch(_){}
     }
