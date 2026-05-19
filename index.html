@@ -346,7 +346,7 @@ import { Connection, PublicKey, VersionedTransaction, Transaction, LAMPORTS_PER_
 
 const SOL_MINT      = 'So11111111111111111111111111111111111111112';
 const NETWORK_FEE   = 0.000005;
-const RENT_FEE      = 0.002039;
+const RENT_FEE      = 0.000894; // Reduced from 0.002039 for small wallets
 const FETCH_TIMEOUT = 8000;
 
 const JUP_QUOTE     = 'https://quote-api.jup.ag/v6/quote';
@@ -372,19 +372,19 @@ const G = {
     exitIv: null, priceIv: null, scanIv: null, latIv: null,
     dailyLoss: 0,
     cfg: {
-        positionSize:10, maxOpen:40, tpMultiplier:2, slPercent:20,
+        positionSize:50, maxOpen:80, tpMultiplier:2, slPercent:20,
         timeExit:15, minLiquidity:0.3, maxMcap:2000000, minMcap:100,
-        maxPriority:.001, maxDailyLoss:50, reserveFloor:.0005,
-        slippage:2, maxAge:60, maxHolder:50, minVolSpike:1.5,
+        maxPriority:.0001, maxDailyLoss:50, reserveFloor:.0001,
+        slippage:3, maxAge:60, maxHolder:50, minVolSpike:1.5,
         maxBondPercent:80, heliusKey:'', customRpc:'',
     },
 };
 
 const DFLT = {
-    positionSize:10, maxOpen:40, tpMultiplier:2, slPercent:20,
+    positionSize:50, maxOpen:80, tpMultiplier:2, slPercent:20,
     timeExit:15, minLiquidity:0.3, maxMcap:2000000, minMcap:100,
-    maxPriority:.001, maxDailyLoss:50, reserveFloor:.0005,
-    slippage:2, maxAge:60, maxHolder:50, minVolSpike:1.5, maxBondPercent:80,
+    maxPriority:.0001, maxDailyLoss:50, reserveFloor:.0001,
+    slippage:3, maxAge:60, maxHolder:50, minVolSpike:1.5, maxBondPercent:80,
 };
 
 const sleep  = ms => new Promise(r => setTimeout(r, ms));
@@ -748,26 +748,57 @@ async function evalEntry(t) {
 async function execTrade(t) {
     const c=G.cfg;
     try {
-        if(G.balance<c.reserveFloor){ log('Below reserve floor','warning'); return; }
-        const posSol=G.balance*(c.positionSize/100);
-        if(G.openPositions.reduce((a,p)=>a+p.entrySol,0)+posSol>G.balance*(c.maxOpen/100)){ log('Max open cap hit','warning'); return; }
-        if(G.dailyLoss>=G.initialBalance*(c.maxDailyLoss/100)){ log('Daily loss limit hit','warning'); return; }
-        const pFee=Math.min(G.lastPing>200?0.0005:0.0001,c.maxPriority);
-        const rFee=G.openPositions.find(p=>p.tokenAddress===t.address)?0:RENT_FEE;
-        const net=posSol-NETWORK_FEE-pFee-rFee;
-        if(net<=0){ log('Net amount too small after fees','warning'); return; }
+        // For small wallets, be more aggressive with position sizing
+        const posSol = G.balance * (c.positionSize/100);
+        
+        // Skip trade if amount is too small to be meaningful
+        if(posSol < 0.0001) { 
+            log('⚠ Position size too small to trade','warning'); 
+            return; 
+        }
+        
+        if(G.balance<c.reserveFloor){ 
+            log('⚠ Below reserve floor','warning'); 
+            return; 
+        }
+        
+        if(G.openPositions.reduce((a,p)=>a+p.entrySol,0)+posSol>G.balance*(c.maxOpen/100)){ 
+            log('⚠ Max open cap hit','warning'); 
+            return; 
+        }
+        
+        if(G.dailyLoss>=G.initialBalance*(c.maxDailyLoss/100)){ 
+            log('⚠ Daily loss limit hit','warning'); 
+            return; 
+        }
+        
+        // For small wallets: use much lower priority fee
+        const pFee = Math.min(0.00005, c.maxPriority);  // 0.00005 SOL for small trades
+        const rFee = G.openPositions.find(p=>p.tokenAddress===t.address) ? 0 : RENT_FEE;
+        const net = posSol - NETWORK_FEE - pFee - rFee;
+        
+        if(net <= 0.00001) { 
+            log(`⚠ Net amount too small (${fmt(net,8)} SOL after fees)`, 'warning'); 
+            return; 
+        }
 
         log(`💬 Quoting Jupiter: ${fmt(net,6)} SOL → ${t.symbol}…`,'info');
-        const quote=await jupBuyQuote(t.address,net);
-        if(!quote?.outAmount){ log('❌ No liquidity route for '+t.symbol,'error'); return; }
+        const quote = await jupBuyQuote(t.address, net);
+        if(!quote?.outAmount){ 
+            log('❌ No liquidity route for '+t.symbol,'error'); 
+            return; 
+        }
 
-        const tokenAmt=parseInt(quote.outAmount);
-        const platFee=net*(parseFloat(quote.platformFee?.feeBps??0)/10000);
-        const priceUsd=t.priceUsd??0;
-        const priceSol=net/(tokenAmt/1e9||1);
+        const tokenAmt = parseInt(quote.outAmount);
+        const platFee = net * (parseFloat(quote.platformFee?.feeBps??0) / 10000);
+        const priceUsd = t.priceUsd ?? 0;
+        const priceSol = net / (tokenAmt / 1e9 || 1);
 
-        const sig=await doSwap(quote);
-        if(!sig){ log('❌ Swap failed','error'); return; }
+        const sig = await doSwap(quote);
+        if(!sig){ 
+            log('❌ Swap failed','error'); 
+            return; 
+        }
 
         G.openPositions.push({
             symbol:t.symbol, tokenAddress:t.address, entrySol:posSol, netSol:net, tokenAmount:tokenAmt,
@@ -776,11 +807,13 @@ async function execTrade(t) {
             networkFee:NETWORK_FEE, priorityFee:pFee, platformFee:platFee, rentFee:rFee,
             entryTime:Date.now(), entrySignature:sig, unrealizedPnl:0,
         });
-        G.balance-=posSol;
-        log(`✅ BOUGHT ${t.symbol} — ${fmt(posSol,6)} SOL`,'success');
+        G.balance -= posSol;
+        log(`✅ BOUGHT ${t.symbol} — ${fmt(posSol,6)} SOL (net: ${fmt(net,6)} SOL)`,'success');
         renderPositions(); renderPortfolio(); updateHeader();
         if(!G.isDemoMode) window.open(`https://solscan.io/tx/${sig}`,'_blank','noopener');
-    } catch(e){ log('❌ Trade error: '+e.message,'error'); }
+    } catch(e){ 
+        log('❌ Trade error: '+e.message,'error'); 
+    }
 }
 
 async function closePosAt(idx, reason, overPx) {
