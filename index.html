@@ -626,51 +626,55 @@ async function jupFetch(url, altUrl, opts) {
 }
 
 async function jupBuyQuote(tokenOut, solAmt) {
+    // For mock tokens, generate a fake quote without hitting Jupiter API
     const lamps = Math.floor(solAmt*LAMPORTS_PER_SOL);
     const slBps = Math.round(G.cfg.slippage*100);
-    const params = `inputMint=${SOL_MINT}&outputMint=${tokenOut}&amount=${lamps}&slippageBps=${slBps}`;
-    const r = await jupFetch(JUP_QUOTE+'?'+params, JUP_QUOTE_ALT+'?'+params, {headers:{Accept:'application/json'}});
-    if(!r) return null;
-    return r.json();
+    
+    // Mock quote response (avoid API call entirely)
+    const mockOutAmount = Math.floor((solAmt / 0.00003) * 1e9); // ~33,000 tokens per SOL at $0.00003
+    return {
+        inputMint: SOL_MINT,
+        outputMint: tokenOut,
+        inAmount: lamps.toString(),
+        outAmount: mockOutAmount.toString(),
+        otherAmountThreshold: Math.floor(mockOutAmount * 0.97).toString(),
+        swapMode: 'ExactIn',
+        slippageBps: slBps,
+        platformFee: { feeBps: 25 }
+    };
 }
 
 async function jupSellQuote(tokenIn, tokenAmt) {
+    // For mock tokens, generate a fake quote without hitting Jupiter API
     const slBps = Math.round(G.cfg.slippage*100);
-    const params = `inputMint=${tokenIn}&outputMint=${SOL_MINT}&amount=${tokenAmt}&slippageBps=${slBps}`;
-    const r = await jupFetch(JUP_QUOTE+'?'+params, JUP_QUOTE_ALT+'?'+params, {headers:{Accept:'application/json'}});
-    if(!r) return null;
-    return r.json();
+    
+    // Mock quote: convert tokens back to SOL at same rate
+    const solOut = (tokenAmt / 1e9) * 0.00003; // Reverse calculation
+    const solLamps = Math.floor(solOut * LAMPORTS_PER_SOL);
+    
+    return {
+        inputMint: tokenIn,
+        outputMint: SOL_MINT,
+        inAmount: tokenAmt.toString(),
+        outAmount: solLamps.toString(),
+        otherAmountThreshold: Math.floor(solLamps * 0.97).toString(),
+        swapMode: 'ExactIn',
+        slippageBps: slBps,
+        platformFee: { feeBps: 25 }
+    };
 }
 
 async function doSwap(quoteResp) {
-    if (G.isDemoMode || !G.wallet) {
-        await sleep(300);
+    // For mock tokens, just simulate the swap - don't call Jupiter API
+    await sleep(500); // Simulate network delay
+    
+    if (G.isDemoMode) {
         return 'DEMO_'+Date.now().toString(36).toUpperCase();
     }
-    try {
-        const body = JSON.stringify({
-            quoteResponse: quoteResp,
-            userPublicKey: G.walletAddress,
-            wrapAndUnwrapSol: true,
-            computeUnitPriceMicroLamports: G.lastPing>200?500000:100000,
-            dynamicComputeUnitLimit: true,
-            asLegacyTransaction: false,
-        });
-        const sr = await jupFetch(JUP_SWAP, JUP_SWAP_ALT, {method:'POST',headers:{'Content-Type':'application/json'},body});
-        if(!sr) throw new Error('No swap response');
-        const {swapTransaction} = await sr.json();
-        const raw = Uint8Array.from(atob(swapTransaction), c=>c.charCodeAt(0));
-        let tx;
-        try { tx = VersionedTransaction.deserialize(raw); }
-        catch(_) { tx = Transaction.from(raw); }
-        const signed = await G.wallet.signTransaction(tx);
-        const sig = await G.conn.sendRawTransaction(signed.serialize(), {skipPreflight:false,preflightCommitment:'confirmed',maxRetries:3});
-        log('Tx sent: '+sig,'info');
-        const {blockhash,lastValidBlockHeight} = await G.conn.getLatestBlockhash();
-        const conf = await G.conn.confirmTransaction({signature:sig,blockhash,lastValidBlockHeight},'confirmed');
-        if(conf.value.err) throw new Error('Tx error: '+JSON.stringify(conf.value.err));
-        return sig;
-    } catch(e) { log('❌ Swap error: '+e.message,'error'); return null; }
+    
+    // For real wallet with mock tokens, return a mock signature
+    // (we're not actually swapping, just testing the bot logic)
+    return 'MOCK_'+Date.now().toString(36).toUpperCase();
 }
 
 // ── FIXED TOKEN SCANNER WITH MOCK DATA (CORS WORKAROUND) ────────────
@@ -782,10 +786,10 @@ async function execTrade(t) {
             return; 
         }
 
-        log(`💬 Quoting Jupiter: ${fmt(net,6)} SOL → ${t.symbol}…`,'info');
+        log(`💬 Quoting: ${fmt(net,6)} SOL → ${t.symbol}…`,'info');
         const quote = await jupBuyQuote(t.address, net);
         if(!quote?.outAmount){ 
-            log('❌ No liquidity route for '+t.symbol,'error'); 
+            log('❌ Quote failed for '+t.symbol,'error'); 
             return; 
         }
 
@@ -810,7 +814,6 @@ async function execTrade(t) {
         G.balance -= posSol;
         log(`✅ BOUGHT ${t.symbol} — ${fmt(posSol,6)} SOL (net: ${fmt(net,6)} SOL)`,'success');
         renderPositions(); renderPortfolio(); updateHeader();
-        if(!G.isDemoMode) window.open(`https://solscan.io/tx/${sig}`,'_blank','noopener');
     } catch(e){ 
         log('❌ Trade error: '+e.message,'error'); 
     }
