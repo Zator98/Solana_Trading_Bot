@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Solana Trading Bot — Real Mainnet v4.0</title>
+    <title>Solana Trading Bot — Real Mainnet v4.1 FIXED</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         *{margin:0;padding:0;box-sizing:border-box;}
@@ -130,7 +130,7 @@
 <body>
 
 <div class="hdr">
-    <div class="hdr-title">◆ SOLANA TRADING BOT — REAL MAINNET v4.0 <span class="live-badge">LIVE</span></div>
+    <div class="hdr-title">◆ SOLANA TRADING BOT — REAL MAINNET v4.1 FIXED <span class="live-badge">LIVE</span></div>
     <div class="hdr-sp"></div>
     <div class="hdr-info">
         <div class="hdr-stat">
@@ -292,9 +292,9 @@
                     <div class="sec-div">Risk Management</div>
                     <div class="frow">
                         <div class="fgrp"><div class="flbl">Time Exit (minutes)</div><input class="finp" type="number" id="cfg-timeExit" step="1" min="1"></div>
-                        <div class="fgrp"><div class="flbl">Max Priority Fee (SOL)</div><input class="finp" type="number" id="cfg-maxPriority" step="0.0001" min="0.00001"></div>
+                        <div class="fgrp"><div class="flbl">Priority Fee (microLamports)</div><input class="finp" type="number" id="cfg-priorityFee" step="1000" min="1000"></div>
                         <div class="fgrp"><div class="flbl">Max Daily Loss (%)</div><input class="finp" type="number" id="cfg-maxDailyLoss" step="1" min="1"></div>
-                        <div class="fgrp"><div class="flbl">Reserve Floor (SOL)</div><input class="finp" type="number" id="cfg-reserveFloor" step="0.0001" min="0.0001"></div>
+                        <div class="fgrp"><div class="flbl">Reserve Floor (SOL)</div><input class="finp" type="number" id="cfg-reserveFloor" step="0.001" min="0.001"></div>
                     </div>
                     <div class="sec-div">Token Filters</div>
                     <div class="frow">
@@ -330,8 +330,7 @@ import { Connection, PublicKey, VersionedTransaction, Transaction, LAMPORTS_PER_
 // ── REAL MAINNET CONFIGURATION ────────────────────────────────
 const SOL_MINT      = 'So11111111111111111111111111111111111111112';
 const NETWORK_FEE   = 0.000005;
-const RENT_FEE      = 0.002039;
-const FETCH_TIMEOUT = 10000; // 10 second timeout for real API calls
+const FETCH_TIMEOUT = 15000; // 15 second timeout for real API calls
 
 // Jupiter API (REAL)
 const JUP_QUOTE     = 'https://quote-api.jup.ag/v6/quote';
@@ -341,6 +340,9 @@ const JUP_SWAP      = 'https://quote-api.jup.ag/v6/swap';
 const DS_NEW        = 'https://api.dexscreener.com/token-profiles/latest/v1';
 const DS_PAIRS      = 'https://api.dexscreener.com/latest/dex/tokens/';
 
+// BirdEye API (for price feeds) - NO API KEY NEEDED for basic calls
+const BIRDEYE_PRICE = 'https://public-api.birdeye.so/defi/price?address=';
+
 const G = {
     wallet: null, walletName: '', walletAddress: null,
     connected: false, status: 'stopped', balance: 0, initialBalance: 0,
@@ -348,11 +350,13 @@ const G = {
     logs: [], lastPing: 0, conn: null, tokens: [],
     exitIv: null, priceIv: null, scanIv: null, latIv: null,
     dailyLoss: 0,
+    priceCache: {}, // Cache for token prices to reduce API calls
+    lastPriceUpdate: {},
     cfg: {
-        positionSize: 3, maxOpen: 40, tpMultiplier: 2, slPercent: 20,
-        timeExit: 30, minLiquidity: 0.5, maxMcap: 5000000, minMcap: 5000,
-        maxPriority: .00005, maxDailyLoss: 50, reserveFloor: .0001,
-        slippage: 2, maxAge: 120, maxHolder: 50, minVolSpike: 2,
+        positionSize: 5, maxOpen: 30, tpMultiplier: 2, slPercent: 20,
+        timeExit: 30, minLiquidity: 2, maxMcap: 2000000, minMcap: 10000,
+        priorityFee: 50000, maxDailyLoss: 50, reserveFloor: 0.001,
+        slippage: 1.5, maxAge: 60, maxHolder: 30, minVolSpike: 3,
         heliusKey: '', customRpc: '',
     },
 };
@@ -360,13 +364,31 @@ const G = {
 const DFLT = {
     positionSize: 5, maxOpen: 30, tpMultiplier: 2, slPercent: 20,
     timeExit: 30, minLiquidity: 2, maxMcap: 2000000, minMcap: 10000,
-    maxPriority: .001, maxDailyLoss: 50, reserveFloor: .00001,  // MICRO WALLETS: 10 lamports
+    priorityFee: 50000, maxDailyLoss: 50, reserveFloor: 0.001,
     slippage: 1.5, maxAge: 60, maxHolder: 30, minVolSpike: 3,
 };
 
 const sleep  = ms => new Promise(r => setTimeout(r, ms));
 const fmt    = (n,d=5) => (n==null||isNaN(+n))? '—' : (+n).toFixed(d);
 const setTxt = (id,v)  => { const e=document.getElementById(id); if(e) e.textContent=v; };
+
+// ── PERSISTENT STORAGE ────────────────────────────────────────
+function saveSettings() {
+    try {
+        localStorage.setItem('solbot_config', JSON.stringify(G.cfg));
+    } catch(e) { log('Failed to save settings: '+e.message, 'warning'); }
+}
+
+function loadSettings() {
+    try {
+        const saved = localStorage.getItem('solbot_config');
+        if (saved) {
+            const cfg = JSON.parse(saved);
+            G.cfg = {...DFLT, ...cfg};
+            log('✓ Settings restored from storage', 'success');
+        }
+    } catch(e) { log('Failed to load settings: '+e.message, 'warning'); }
+}
 
 function log(msg, type='info') {
     const ts = new Date().toLocaleTimeString();
@@ -392,23 +414,38 @@ function renderLog() {
 function rpcUrl() {
     if (G.cfg.customRpc) return G.cfg.customRpc;
     if (G.cfg.heliusKey) return `https://mainnet.helius-rpc.com/?api-key=${G.cfg.heliusKey}`;
-    return 'https://api.mainnet-beta.solana.com';
+    // Fallback to Helius public endpoint (rate limited but free)
+    return 'https://rpc-mainnet.helius.xyz/';
 }
 
 async function initConn() {
     try {
-        G.conn = new Connection(rpcUrl(), {commitment:'confirmed', confirmTransactionInitialTimeout:60000});
-        log('✓ RPC Connected: ' + rpcUrl().replace(/api-key=\S+/, 'api-key=***'), 'success');
-    } catch(e) { log('❌ RPC Error: '+e.message,'error'); }
+        G.conn = new Connection(rpcUrl(), {
+            commitment:'confirmed', 
+            confirmTransactionInitialTimeout:120000  // 2 minutes for real mainnet
+        });
+        // Test connection
+        const slot = await Promise.race([
+            G.conn.getSlot(),
+            new Promise((_,rej) => setTimeout(()=>rej(new Error('RPC timeout')), 5000))
+        ]);
+        log('✓ RPC Connected (slot '+slot+'): ' + rpcUrl().replace(/api-key=\S+/, 'api-key=***'), 'success');
+    } catch(e) { 
+        log('❌ RPC Error: '+e.message,'error'); 
+        throw e;
+    }
 }
 
 async function fetchBal() {
     if (!G.walletAddress || !G.conn) return;
     try {
         const lamps = await G.conn.getBalance(new PublicKey(G.walletAddress));
-        G.balance = lamps / LAMPORTS_PER_SOL;
-        if (!G.initialBalance) { G.initialBalance=G.balance; setTxt('s-init', fmt(G.balance)+' SOL'); }
-        updateHeader();
+        const newBal = lamps / LAMPORTS_PER_SOL;
+        if (newBal !== G.balance) {
+            G.balance = newBal;
+            if (!G.initialBalance) { G.initialBalance=G.balance; setTxt('s-init', fmt(G.balance, 6)+' SOL'); }
+            updateHeader();
+        }
     } catch(e) { log('Balance error: '+e.message,'error'); }
 }
 
@@ -416,7 +453,10 @@ async function tickLatency() {
     if (!G.conn) return;
     const t0=performance.now();
     try {
-        await G.conn.getSlot();
+        await Promise.race([
+            G.conn.getSlot(),
+            new Promise((_,rej) => setTimeout(()=>rej(new Error('Timeout')), 5000))
+        ]);
         G.lastPing = Math.round(performance.now()-t0);
         setTxt('lat-txt', G.lastPing+' ms');
         const d=document.getElementById('lat-dot'); if(!d) return;
@@ -438,12 +478,41 @@ async function fetchWithTimeout(url, opts={}) {
     }
 }
 
+// ── WALLET DETECTION - FIXED FOR PHANTOM ────────────────────
 function getProviders() {
-    return [
-        { id:'phantom',  name:'Phantom',      provider: window.phantom?.solana ?? (window.solana?.isPhantom?window.solana:null), detected: !!(window.phantom?.solana||window.solana?.isPhantom) },
-        { id:'okx',      name:'OKX Wallet',  provider: window.okxwallet?.solana,          detected: !!window.okxwallet?.solana },
-        { id:'solflare', name:'Solflare',     provider: window.solflare?.isSolflare?window.solflare:null, detected: !!window.solflare?.isSolflare },
-    ].filter(p=>p.provider);
+    const providers = [];
+    
+    // Phantom (most common)
+    if (window.phantom?.solana?.isPhantom) {
+        providers.push({
+            id: 'phantom',
+            name: 'Phantom',
+            provider: window.phantom.solana,
+            detected: true
+        });
+    }
+    
+    // OKX Wallet
+    if (window.okxwallet?.solana) {
+        providers.push({
+            id: 'okx',
+            name: 'OKX Wallet',
+            provider: window.okxwallet.solana,
+            detected: true
+        });
+    }
+    
+    // Solflare
+    if (window.solflare?.isSolflare) {
+        providers.push({
+            id: 'solflare',
+            name: 'Solflare',
+            provider: window.solflare,
+            detected: true
+        });
+    }
+    
+    return providers;
 }
 
 function openWalletModal() {
@@ -459,10 +528,10 @@ function openWalletModal() {
         }
         for (const p of providers) {
             const opt = document.createElement('div');
-            opt.className = 'wallet-opt' + (p.detected?' detected':'');
+            opt.className = 'wallet-opt detected';
             opt.innerHTML = `<span style="font-size:20px;">${p.id==='phantom'?'👻':p.id==='okx'?'🟢':'✨'}</span>
                 <span class="wo-name">${p.name}</span>
-                <span class="wo-status">${p.detected?'✓ Detected':'Not found'}</span>`;
+                <span class="wo-status">✓ Detected</span>`;
             opt.addEventListener('click', () => {
                 modal.style.display='none';
                 doConnect(p);
@@ -480,15 +549,30 @@ async function doConnect(providerObj) {
     const btn = document.getElementById('wallet-btn');
     if(btn){ btn.disabled=true; btn.textContent='Connecting…'; }
     log(`Connecting to ${providerObj.name}…`,'info');
+    
+    // Stop any existing intervals before connecting
+    clearAllIntervals();
+    
     try {
         const prov = providerObj.provider;
+        
+        // Connect with timeout
         let resp = await Promise.race([
             prov.connect(),
-            new Promise((_,rej) => setTimeout(()=>rej(new Error('TIMEOUT')),30000))
+            new Promise((_,rej) => setTimeout(()=>rej(new Error('Connection timeout')), 30000))
         ]);
         
-        let pk = resp?.publicKey?.toString?.() ?? resp?.toString?.() ?? prov.publicKey?.toString?.();
-        if (!pk || pk.length < 32) throw new Error('Could not get public key');
+        // Extract public key - Phantom returns it in various ways
+        let pk = null;
+        if (resp?.publicKey) {
+            pk = resp.publicKey.toString();
+        } else if (typeof resp === 'object' && resp.publicKey) {
+            pk = resp.publicKey.toString();
+        } else if (prov.publicKey) {
+            pk = prov.publicKey.toString();
+        }
+        
+        if (!pk || pk.length < 32) throw new Error('Could not get public key from wallet');
 
         G.wallet = prov;
         G.walletName = providerObj.name;
@@ -498,23 +582,45 @@ async function doConnect(providerObj) {
         if(btn){ btn.textContent=`✓ ${pk.slice(0,8)}…`; btn.className='wbtn ok'; btn.disabled=false; }
         const ca = document.getElementById('conn-alert');
         if(ca){ ca.innerHTML=''; const d=document.createElement('div'); d.className='alert ok'; d.textContent=`✓ MAINNET LIVE — Real SOL Trading — ${providerObj.name}`; ca.appendChild(d); }
-        log(`✓ Wallet connected via ${providerObj.name}`,'success');
+        log(`✓ Wallet connected: ${pk}`,'success');
 
         await initConn();
         await fetchBal();
         document.getElementById('start-btn').disabled=false;
-        G.latIv = setInterval(tickLatency,5000);
-        setInterval(fetchBal,15000);
+        G.latIv = setInterval(tickLatency, 5000);
+        const balInterval = setInterval(fetchBal, 15000);
+        G._intervals = [balInterval]; // Track intervals
         tickLatency();
 
         if(prov.on) {
-            prov.on('disconnect',  ()=>{ G.connected=false; log('Wallet disconnected','warning'); });
-            prov.on('accountChanged', k=>{ if(k){ G.walletAddress=k.toString(); log('Account changed: '+k.toString(),'warning'); } });
+            prov.on('disconnect', ()=>{ 
+                G.connected=false; 
+                log('Wallet disconnected','warning'); 
+                clearAllIntervals();
+            });
+            prov.on('accountChanged', k=>{ 
+                if(k){ 
+                    G.walletAddress=k.toString(); 
+                    log('Account changed: '+k.toString(),'warning'); 
+                    fetchBal();
+                } 
+            });
         }
     } catch(e) {
         log('❌ Connection failed: '+e.message,'error');
         if(btn){ btn.disabled=false; btn.textContent='Connect Wallet'; }
-        document.getElementById('wmodal').style.display='flex';
+        setTimeout(() => openWalletModal(), 1000);
+    }
+}
+
+function clearAllIntervals() {
+    if (G.latIv) { clearInterval(G.latIv); G.latIv = null; }
+    if (G.exitIv) { clearInterval(G.exitIv); G.exitIv = null; }
+    if (G.priceIv) { clearInterval(G.priceIv); G.priceIv = null; }
+    if (G.scanIv) { clearInterval(G.scanIv); G.scanIv = null; }
+    if (G._intervals) {
+        G._intervals.forEach(iv => clearInterval(iv));
+        G._intervals = [];
     }
 }
 
@@ -525,12 +631,21 @@ document.getElementById('wallet-btn').addEventListener('click',()=>{
 
 // ── REAL JUPITER API CALLS ────────────────────────────────────
 async function jupBuyQuote(tokenOut, solAmt) {
+    if (solAmt <= 0) {
+        log('Invalid trade amount: '+solAmt, 'error');
+        return null;
+    }
     const lamps = Math.floor(solAmt*LAMPORTS_PER_SOL);
     const slBps = Math.round(G.cfg.slippage*100);
-    const params = `inputMint=${SOL_MINT}&outputMint=${tokenOut}&amount=${lamps}&slippageBps=${slBps}`;
+    const params = `inputMint=${SOL_MINT}&outputMint=${tokenOut}&amount=${lamps}&slippageBps=${slBps}&maxAccounts=25`;
     try {
         const r = await fetchWithTimeout(JUP_QUOTE+'?'+params, {headers:{Accept:'application/json'}});
-        return r.json();
+        const data = await r.json();
+        if (!data.outAmount) {
+            log('No swap route found for token','warning');
+            return null;
+        }
+        return data;
     } catch(e) {
         log('❌ Jupiter quote failed: '+e.message,'error');
         return null;
@@ -538,26 +653,35 @@ async function jupBuyQuote(tokenOut, solAmt) {
 }
 
 async function jupSellQuote(tokenIn, tokenAmt) {
+    if (tokenAmt <= 0) {
+        log('Invalid token amount: '+tokenAmt, 'error');
+        return null;
+    }
     const slBps = Math.round(G.cfg.slippage*100);
-    const params = `inputMint=${tokenIn}&outputMint=${SOL_MINT}&amount=${tokenAmt}&slippageBps=${slBps}`;
+    const params = `inputMint=${tokenIn}&outputMint=${SOL_MINT}&amount=${tokenAmt}&slippageBps=${slBps}&maxAccounts=25`;
     try {
         const r = await fetchWithTimeout(JUP_QUOTE+'?'+params, {headers:{Accept:'application/json'}});
-        return r.json();
+        const data = await r.json();
+        if (!data.outAmount) {
+            log('No swap route found for exit','warning');
+            return null;
+        }
+        return data;
     } catch(e) {
         log('❌ Jupiter quote failed: '+e.message,'error');
         return null;
     }
 }
 
-// ── REAL SWAP EXECUTION ────────────────────────────────────────
+// ── REAL SWAP EXECUTION WITH PROPER ERROR HANDLING ────────────
 async function doSwap(quoteResp) {
-    if (!G.wallet || !G.conn) return null;
+    if (!G.wallet || !G.conn || !quoteResp) return null;
     try {
         const body = JSON.stringify({
             quoteResponse: quoteResp,
             userPublicKey: G.walletAddress,
             wrapAndUnwrapSol: true,
-            computeUnitPriceMicroLamports: 50000,
+            computeUnitPriceMicroLamports: G.cfg.priorityFee,
             dynamicComputeUnitLimit: true,
             asLegacyTransaction: false,
         });
@@ -565,37 +689,62 @@ async function doSwap(quoteResp) {
         const sr = await fetchWithTimeout(JUP_SWAP, {
             method:'POST',
             headers:{'Content-Type':'application/json'},
-            body
+            body,
+            timeout: 15000
         });
-        if(!sr) throw new Error('No swap response');
-        const {swapTransaction} = await sr.json();
+        const swapData = await sr.json();
+        if(!swapData?.swapTransaction) throw new Error('No swap transaction returned');
+        const {swapTransaction} = swapData;
         
-        // Deserialize and sign transaction
+        // Deserialize transaction
         const raw = Uint8Array.from(atob(swapTransaction), c=>c.charCodeAt(0));
         let tx;
-        try { tx = VersionedTransaction.deserialize(raw); }
-        catch(_) { tx = Transaction.from(raw); }
+        try { 
+            tx = VersionedTransaction.deserialize(raw); 
+        } catch(_) { 
+            tx = Transaction.from(raw); 
+        }
         
+        // Sign with wallet
         const signed = await G.wallet.signTransaction(tx);
+        if (!signed) throw new Error('Wallet refused to sign transaction');
+        
+        // Send transaction
         const sig = await G.conn.sendRawTransaction(signed.serialize(), {
             skipPreflight: false,
             preflightCommitment: 'confirmed',
-            maxRetries: 5
+            maxRetries: 3
         });
         
-        log('📤 Tx sent: '+sig.slice(0,12)+'…','info');
+        log('📤 Tx sent: '+sig.slice(0,16)+'…','info');
         
-        // Wait for confirmation
-        const {blockhash, lastValidBlockHeight} = await G.conn.getLatestBlockhash();
-        const conf = await G.conn.confirmTransaction({
-            signature: sig,
-            blockhash,
-            lastValidBlockHeight
-        }, 'confirmed');
+        // Wait for confirmation on FINALIZED commitment (not just confirmed)
+        const {blockhash, lastValidBlockHeight} = await G.conn.getLatestBlockhash('confirmed');
+        let conf = null;
+        try {
+            conf = await Promise.race([
+                G.conn.confirmTransaction({
+                    signature: sig,
+                    blockhash,
+                    lastValidBlockHeight
+                }, 'finalized'),
+                new Promise((_,rej) => setTimeout(()=>rej(new Error('Confirmation timeout')), 90000))
+            ]);
+        } catch(e) {
+            log('⚠ Transaction confirmation timeout - checking status...','warning');
+            // Check if tx actually confirmed
+            await sleep(5000);
+            const status = await G.conn.getSignatureStatus(sig);
+            if (status.value?.confirmationStatus === 'finalized' || status.value?.err === null) {
+                conf = {value: {err: null}};
+            } else {
+                throw new Error('Transaction may have failed - '+JSON.stringify(status.value));
+            }
+        }
         
-        if(conf.value.err) throw new Error('Tx failed: '+JSON.stringify(conf.value.err));
+        if(conf?.value?.err) throw new Error('Tx failed: '+JSON.stringify(conf.value.err));
         
-        log('✅ Tx confirmed: '+sig.slice(0,12)+'…','success');
+        log('✅ Tx confirmed: '+sig.slice(0,16)+'…','success');
         window.open(`https://solscan.io/tx/${sig}`,'_blank','noopener');
         return sig;
     } catch(e) {
@@ -616,7 +765,6 @@ async function startScan() {
             const items = (Array.isArray(data)?data:[]).filter(t=>t.chainId==='solana'&&t.tokenAddress);
             
             if(items.length === 0) return;
-            log(`📊 Found ${items.length} new tokens`,'info');
             
             for(const t of items.slice(0,15)) {
                 if(G.tokens.find(x=>x.address===t.tokenAddress)) continue;
@@ -626,6 +774,8 @@ async function startScan() {
                     const pr = await fetchWithTimeout(DS_PAIRS+t.tokenAddress, {headers:{Accept:'application/json'}});
                     if(pr.ok) pd = (await pr.json())?.pairs?.[0] ?? null;
                 } catch(_){}
+                
+                if (!pd) continue;
                 
                 const liq = parseFloat(pd?.liquidity?.usd??0)/150 || 0;
                 const mcap = parseFloat(pd?.marketCap ?? pd?.fdv ?? 0);
@@ -638,6 +788,7 @@ async function startScan() {
                     symbol: (t.description||pd?.baseToken?.symbol||'???').slice(0,14),
                     name: pd?.baseToken?.name??'',
                     address: t.tokenAddress,
+                    decimals: pd?.baseToken?.decimals ?? 9,
                     age, liquidity: liq, mcap, volume5m: v5m, avgVolume1m: v1h/60,
                     priceUsd: price,
                     signal: sigStrength(liq,mcap,v5m,v1h/60),
@@ -651,7 +802,7 @@ async function startScan() {
         } catch(e){ log('❌ Scan error: '+e.message,'error'); }
     };
     poll();
-    G.scanIv=setInterval(poll,8000);
+    G.scanIv=setInterval(poll, 8000);
 }
 
 function sigStrength(liq,mcap,v5m,avgVol) {
@@ -671,7 +822,7 @@ async function evalEntry(t) {
     const spike=t.volume5m/(t.avgVolume1m||0.1);
     if(spike<c.minVolSpike)         f.push('Spike');
     
-    if(f.length) return; // Silent skip
+    if(f.length) return;
     
     log(`✅ SIGNAL: ${t.symbol} — age:${fmt(t.age,1)}m liq:${fmt(t.liquidity,2)}SOL mcap:$${fmt(t.mcap,0)}`,'success');
     await execTrade(t);
@@ -680,67 +831,52 @@ async function evalEntry(t) {
 async function execTrade(t) {
     const c=G.cfg;
     try {
-        // DEBUG: Show actual balance on first attempt
-        if(!G.openPositions.length && !G.tradeHistory.length && G.logs.filter(l=>l.msg.includes('Balance:')).length<1) {
-            log(`Balance: ${fmt(G.balance, 12)} SOL (${(G.balance*LAMPORTS_PER_SOL).toFixed(0)} lamports)`, 'info');
+        // Validate wallet has minimum balance
+        if(G.balance < 0.001) {
+            log(`❌ Insufficient balance: ${fmt(G.balance,6)} SOL (need at least 0.001 SOL)`, 'error');
+            return;
         }
         
-        // For SMALL WALLETS: use most of balance
-        let posPercent = c.positionSize;
-        if(G.balance < 0.01) posPercent = 99;      // < 0.01 SOL: use 99%
-        else if(G.balance < 0.05) posPercent = 95;  // < 0.05 SOL: use 95%
-        else if(G.balance < 0.1) posPercent = 90;   // < 0.1 SOL: use 90%
+        // Calculate position size
+        let posSol = (G.balance * c.positionSize) / 100;
         
-        let posSol = G.balance * (posPercent/100);
-        
-        // Reduce fees for tiny wallets
-        let pFee = 0.00005;  // Priority fee
-        let rFee = 0.001;    // Rent fee estimate
-        if(G.balance < 0.01) { 
-            pFee = 0.000001;  // Almost nothing for micro trades
-            rFee = 0.0005;    // Reduced rent estimate
+        // Minimum trade to avoid issues
+        const MIN_TRADE = 0.0001;
+        if(posSol < MIN_TRADE) {
+            log(`Position too small: ${fmt(posSol,8)} SOL (min ${MIN_TRADE})`, 'error');
+            return;
         }
         
-        const totalFees = NETWORK_FEE + pFee + rFee;
-        const net = posSol - totalFees;
-        
-        // If net is negative, use remaining balance minus fees
-        if(net <= 0.00001) {
-            posSol = Math.max(0, G.balance - totalFees - 0.000001);
-            if(posSol <= 0) {
-                log(`❌ Insufficient balance: ${fmt(G.balance,12)} SOL (need >${fmt(totalFees+0.000001,12)} SOL for any trade)`, 'error');
-                return;
-            }
+        // Check reserve floor
+        if(G.balance - posSol < c.reserveFloor) {
+            posSol = Math.max(MIN_TRADE, G.balance - c.reserveFloor);
         }
         
-        if(G.balance < c.reserveFloor) { log('Below reserve floor','warning'); return; }
+        // Check max open positions
         const open = G.openPositions.reduce((a,p)=>a+p.entrySol,0);
-        if(open+posSol > G.balance*(c.maxOpen/100)) { log('Max open hit','warning'); return; }
-        
-        const finalNet = posSol - totalFees;
-        if(finalNet <= 0.000001) { 
-            log(`❌ Net = ${fmt(finalNet,12)} SOL (trade too small)`, 'error'); 
-            return; 
+        const maxOpen = (G.balance * c.maxOpen) / 100;
+        if(open + posSol > maxOpen) {
+            log('Max open positions reached','warning');
+            return;
         }
-        log(`📊 Trade size: ${fmt(posSol,8)} SOL - fees ${fmt(totalFees,8)} = ${fmt(finalNet,8)} SOL`, 'info');
-
-        log(`💬 Quoting: ${fmt(finalNet,6)} SOL → ${t.symbol}…`,'info');
-        const quote = await jupBuyQuote(t.address, finalNet);
-        if(!quote?.outAmount) { log('No route','error'); return; }
+        
+        log(`💬 Quoting: ${fmt(posSol,6)} SOL → ${t.symbol}…`,'info');
+        const quote = await jupBuyQuote(t.address, posSol);
+        if(!quote?.outAmount) { log('No swap route','error'); return; }
 
         const tokenAmt = parseInt(quote.outAmount);
         const priceUsd = t.priceUsd ?? 0;
-        const priceSol = finalNet / (tokenAmt/1e9 || 1);
+        const priceSol = posSol / (tokenAmt/(Math.pow(10, t.decimals || 9)) || 1);
 
         const sig = await doSwap(quote);
         if(!sig) return;
 
         G.openPositions.push({
-            symbol:t.symbol, tokenAddress:t.address, entrySol:posSol, netSol:finalNet, tokenAmount:tokenAmt,
+            symbol:t.symbol, tokenAddress:t.address, entrySol:posSol, tokenAmount:tokenAmt,
             entryPriceSol:priceSol, entryPriceUsd:priceUsd, currentPrice:priceUsd,
             takeProfitPrice:priceUsd*c.tpMultiplier, stopLossPrice:priceUsd*(1-c.slPercent/100),
-            networkFee:NETWORK_FEE, priorityFee:pFee, rentFee:rFee,
             entryTime:Date.now(), entrySignature:sig, unrealizedPnl:0,
+            decimals: t.decimals || 9,
         });
         G.balance -= posSol;
         log(`✅ BOUGHT ${t.symbol} — ${fmt(posSol,6)} SOL`,'success');
@@ -760,13 +896,13 @@ async function closePosAt(idx, reason, overPx) {
     }
     
     const exitPx = overPx ?? pos.currentPrice ?? pos.entryPriceUsd;
-    const pnl = (exitPx - pos.entryPriceUsd) * (pos.tokenAmount/1e9);
+    const tokenUnits = pos.tokenAmount / Math.pow(10, pos.decimals || 9);
+    const pnl = (exitPx - pos.entryPriceUsd) * tokenUnits;
     
     G.tradeHistory.push({
         symbol:pos.symbol, tokenAddress:pos.tokenAddress,
         entryPriceSol:pos.entryPriceSol, exitPriceSol:exitPx,
         entryTime:pos.entryTime, exitTime:Date.now(),
-        networkFee:pos.networkFee, priorityFee:pos.priorityFee, rentFee:pos.rentFee,
         netPnl:pnl, exitReason:reason,
         entrySignature:pos.entrySignature, exitSignature:sig,
     });
@@ -774,7 +910,7 @@ async function closePosAt(idx, reason, overPx) {
     if(pnl<0) G.dailyLoss += Math.abs(pnl);
     G.openPositions.splice(idx,1);
     
-    log(`${reason}: ${pos.symbol} P&L: ${fmt(pnl,8)} SOL`, pnl>=0?'success':'warning');
+    log(`${reason}: ${pos.symbol} P&L: ${fmt(pnl,6)} SOL`, pnl>=0?'success':'warning');
     renderPositions(); renderHistory(); renderPortfolio(); updateHeader(); renderChart();
     await fetchBal();
 }
@@ -792,13 +928,30 @@ function startMonitor() {
 }
 
 async function refreshPrices() {
+    if (G.openPositions.length === 0) return;
+    
     for(const pos of G.openPositions) {
         try {
-            const p = await fetchWithTimeout('https://public-api.birdeye.so/defi/price?address='+pos.tokenAddress, {headers:{accept:'application/json','x-chain':'solana'}});
+            // Check cache first
+            const now = Date.now();
+            if (G.priceCache[pos.tokenAddress] && (now - (G.lastPriceUpdate[pos.tokenAddress] || 0)) < 5000) {
+                pos.currentPrice = G.priceCache[pos.tokenAddress];
+                pos.unrealizedPnl=(pos.currentPrice-pos.entryPriceUsd)*(pos.tokenAmount/(Math.pow(10, pos.decimals || 9)));
+                continue;
+            }
+            
+            const p = await fetchWithTimeout(BIRDEYE_PRICE+pos.tokenAddress+'&x-chain=solana', {
+                headers:{accept:'application/json'}
+            });
             if(p.ok) {
                 const d = await p.json();
                 const price = d?.data?.value;
-                if(price>0) { pos.currentPrice=price; pos.unrealizedPnl=(price-pos.entryPriceUsd)*(pos.tokenAmount/1e9); }
+                if(price > 0) {
+                    pos.currentPrice = price;
+                    pos.unrealizedPnl = (price - pos.entryPriceUsd) * (pos.tokenAmount / Math.pow(10, pos.decimals || 9));
+                    G.priceCache[pos.tokenAddress] = price;
+                    G.lastPriceUpdate[pos.tokenAddress] = now;
+                }
             }
         } catch(_){}
     }
@@ -809,8 +962,8 @@ function updateHeader() {
     const r=G.tradeHistory.reduce((a,t)=>a+(t.netPnl||0),0);
     const u=G.openPositions.reduce((a,p)=>a+(p.unrealizedPnl||0),0);
     const tot=r+u;
-    setTxt('hdr-bal',fmt(G.balance)+' SOL');
-    const pe=document.getElementById('hdr-pnl'); if(pe){ pe.textContent=fmt(tot)+' SOL'; pe.style.color=tot>=0?'var(--green)':'var(--red)'; }
+    setTxt('hdr-bal',fmt(G.balance, 6)+' SOL');
+    const pe=document.getElementById('hdr-pnl'); if(pe){ pe.textContent=fmt(tot, 6)+' SOL'; pe.style.color=tot>=0?'var(--green)':'var(--red)'; }
 }
 
 function renderPortfolio() {
@@ -818,11 +971,11 @@ function renderPortfolio() {
     const u=G.openPositions.reduce((a,p)=>a+(p.unrealizedPnl||0),0);
     const wins=G.tradeHistory.filter(t=>t.netPnl>0).length;
     const wr=G.tradeHistory.length?((wins/G.tradeHistory.length)*100).toFixed(1):0;
-    setTxt('s-cur',fmt(G.balance)+' SOL');
+    setTxt('s-cur',fmt(G.balance, 6)+' SOL');
     setTxt('s-tt',G.tradeHistory.length);
     setTxt('s-wr',wr+'%');
-    const re=document.getElementById('s-rpnl'); if(re){re.textContent=fmt(r)+' SOL';re.className='stat-val '+(r>=0?'pos':'neg');}
-    const ue=document.getElementById('s-upnl'); if(ue){ue.textContent=fmt(u)+' SOL';ue.className='stat-val '+(u>=0?'pos':'neg');}
+    const re=document.getElementById('s-rpnl'); if(re){re.textContent=fmt(r, 6)+' SOL';re.className='stat-val '+(r>=0?'pos':'neg');}
+    const ue=document.getElementById('s-upnl'); if(ue){ue.textContent=fmt(u, 6)+' SOL';ue.className='stat-val '+(u>=0?'pos':'neg');}
 }
 
 function updateStatusUI() {
@@ -893,10 +1046,10 @@ function renderPositions() {
         const s1=document.createElement('div'); s1.className='tk-sym'; s1.textContent=p.symbol;
         const s2=document.createElement('div'); s2.className='tk-addr'; s2.textContent=p.tokenAddress.slice(0,8)+'…';
         sc.appendChild(s1); sc.appendChild(s2);
-        [fmt(p.entryPriceSol,8),fmt(p.currentPrice,8)].forEach(v=>{const td=tr.insertCell();td.className='num';td.textContent=v;});
-        const ptd=tr.insertCell(); ptd.className='num '+(p.unrealizedPnl>=0?'pos':'neg'); ptd.textContent=fmt(p.unrealizedPnl,8)+' SOL';
+        [fmt(p.entryPriceSol,6),fmt(p.currentPrice,6)].forEach(v=>{const td=tr.insertCell();td.className='num';td.textContent=v;});
+        const ptd=tr.insertCell(); ptd.className='num '+(p.unrealizedPnl>=0?'pos':'neg'); ptd.textContent=fmt(p.unrealizedPnl,6)+' SOL';
         tr.insertCell().textContent=age+'m';
-        const tpsl=tr.insertCell(); tpsl.style.fontSize='10px'; tpsl.textContent=`TP:${fmt(p.takeProfitPrice,8)} SL:${fmt(p.stopLossPrice,8)}`;
+        const tpsl=tr.insertCell(); tpsl.style.fontSize='10px'; tpsl.textContent=`TP:${fmt(p.takeProfitPrice,6)} SL:${fmt(p.stopLossPrice,6)}`;
         const act=tr.insertCell(); const cb=document.createElement('button'); cb.className='btn r'; cb.style.cssText='padding:3px 7px;font-size:11px;';
         cb.textContent='Close'; cb.addEventListener('click',()=>closePosAt(i,'MANUAL',p.currentPrice)); act.appendChild(cb);
     }
@@ -911,11 +1064,10 @@ function renderHistory() {
     for(const t of [...G.tradeHistory].reverse()){
         const tr=tb.insertRow();
         tr.insertCell().textContent=t.symbol;
-        const fee=((t.networkFee||0)+(t.priorityFee||0)+(t.rentFee||0));
-        [fmt(t.entryPriceSol,8),fmt(t.exitPriceSol,8),
+        [fmt(t.entryPriceSol,6),fmt(t.exitPriceSol,6),
          new Date(t.entryTime).toLocaleTimeString(),new Date(t.exitTime).toLocaleTimeString(),
-         fmt(fee,8)].forEach(v=>{const td=tr.insertCell();td.className='num';td.textContent=v;});
-        const ptd=tr.insertCell(); ptd.className='num '+(t.netPnl>=0?'pos':'neg'); ptd.textContent=fmt(t.netPnl,8)+' SOL';
+         '—'].forEach(v=>{const td=tr.insertCell();td.className='num';td.textContent=v;});
+        const ptd=tr.insertCell(); ptd.className='num '+(t.netPnl>=0?'pos':'neg'); ptd.textContent=fmt(t.netPnl,6)+' SOL';
         const xtd=tr.insertCell();
         if(t.exitSignature){
             const a=document.createElement('a'); a.href='https://solscan.io/tx/'+t.exitSignature;
@@ -950,7 +1102,7 @@ document.getElementById('fc-calc').addEventListener('click',()=>{
     const total=NETWORK_FEE+pf+slipFee;
     const net=inp-total;
     const el=document.getElementById('fc-result'); if(!el) return;
-    el.innerHTML=`<table class="dtbl"><tr><td>Input</td><td>${fmt(inp)} SOL</td></tr><tr><td>Network Fee</td><td>${NETWORK_FEE.toFixed(6)} SOL</td></tr><tr><td>Priority Fee</td><td>${fmt(pf)} SOL</td></tr><tr><td>Slippage (${slip}%)</td><td>${fmt(slipFee)} SOL</td></tr><tr style="border-bottom:2px solid var(--teal);"><td><b>Total Fees</b></td><td><b>${fmt(total)} SOL</b></td></tr><tr><td><b>Net Out</b></td><td style="color:var(--teal);font-weight:700;"><b>${fmt(net)} SOL</b></td></tr></table>`;
+    el.innerHTML=`<table class="dtbl"><tr><td>Input</td><td>${fmt(inp, 6)} SOL</td></tr><tr><td>Network Fee</td><td>${NETWORK_FEE.toFixed(6)} SOL</td></tr><tr><td>Priority Fee</td><td>${fmt(pf, 6)} SOL</td></tr><tr><td>Slippage (${slip}%)</td><td>${fmt(slipFee, 6)} SOL</td></tr><tr style="border-bottom:2px solid var(--teal);"><td><b>Total Fees</b></td><td><b>${fmt(total, 6)} SOL</b></td></tr><tr><td><b>Net Out</b></td><td style="color:var(--teal);font-weight:700;"><b>${fmt(net, 6)} SOL</b></td></tr></table>`;
 });
 
 function loadCfgUI() {
@@ -961,25 +1113,32 @@ document.getElementById('s-save').addEventListener('click',()=>{
     for(const k of Object.keys(DFLT)){ const e=document.getElementById('cfg-'+k); if(e) G.cfg[k]=parseFloat(e.value)||DFLT[k]; }
     const h=document.getElementById('cfg-helius'); if(h) G.cfg.heliusKey=h.value.trim();
     const r=document.getElementById('cfg-rpc'); if(r) G.cfg.customRpc=r.value.trim();
-    log('✓ Settings saved','success');
-    if(G.conn) initConn();
+    saveSettings();
+    log('✓ Settings saved & persisted','success');
+    if(G.conn) initConn().catch(e=>log('RPC reconnect failed: '+e.message,'error'));
 });
 
 document.getElementById('s-reset').addEventListener('click',()=>{
-    G.cfg={...DFLT}; loadCfgUI(); log('↻ Settings reset','info');
+    G.cfg={...DFLT}; 
+    loadCfgUI();
+    localStorage.removeItem('solbot_config');
+    log('↻ Settings reset to defaults','info');
 });
 
 document.getElementById('start-btn').addEventListener('click',()=>{
     if(!G.connected){ log('Connect wallet first','warning'); return; }
     G.status='running'; updateStatusUI(); startMonitor(); startScan();
+    G.priceIv=setInterval(refreshPrices, 3000); // More frequent price updates
+    G._intervals = [...(G._intervals || []), G.priceIv];
     log('🚀 Bot started — REAL MAINNET TRADING','success');
-    setInterval(refreshPrices, 5000);
 });
+
 document.getElementById('stop-btn').addEventListener('click',()=>{
     G.status='stopped'; updateStatusUI();
-    clearInterval(G.exitIv); clearInterval(G.priceIv); clearInterval(G.scanIv);
+    clearAllIntervals();
     log('⏹ Bot stopped','info');
 });
+
 document.getElementById('emrg-btn').addEventListener('click',async()=>{
     if(!G.openPositions.length){ log('No open positions','info'); return; }
     if(!confirm('Close ALL positions immediately?')) return;
@@ -1000,22 +1159,29 @@ document.getElementById('tf-sym')?.addEventListener('input',renderFeed);
 document.getElementById('tf-sig')?.addEventListener('change',renderFeed);
 
 document.getElementById('export-btn').addEventListener('click',()=>{
-    const rows=['Symbol,Entry,Exit,EntryTime,ExitTime,TotalFee,NetPnL,TxHash'];
+    const rows=['Symbol,Entry,Exit,EntryTime,ExitTime,NetPnL,TxHash'];
     for(const t of G.tradeHistory){
-        const f=((t.networkFee||0)+(t.priorityFee||0)+(t.rentFee||0)).toFixed(8);
-        rows.push([t.symbol,fmt(t.entryPriceSol,8),fmt(t.exitPriceSol,8),
+        rows.push([t.symbol,fmt(t.entryPriceSol,6),fmt(t.exitPriceSol,6),
             new Date(t.entryTime).toISOString(),new Date(t.exitTime).toISOString(),
-            f,fmt(t.netPnl,8),t.exitSignature||''].join(','));
+            fmt(t.netPnl,6),t.exitSignature||''].join(','));
     }
     const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([rows.join('\n')],{type:'text/csv'}));
     a.download='trades_'+Date.now()+'.csv'; a.click();
 });
 
-log('🤖 Solana Trading Bot v4.0 — REAL MAINNET','info');
+// ── INITIALIZATION ────────────────────────────────────────────
+log('🤖 Solana Trading Bot v4.1 FIXED','info');
 log('⚠ WARNING: This trades with REAL SOL on mainnet. Use small amounts to test!','warning');
 log('Click "Connect Wallet" to begin','info');
 initChart();
+loadSettings();
 loadCfgUI();
+
+// Clean up on page unload
+window.addEventListener('beforeunload', ()=>{
+    clearAllIntervals();
+    if(G.wallet && G.wallet.disconnect) G.wallet.disconnect();
+});
 </script>
 </body>
 </html>
