@@ -349,10 +349,10 @@ const G = {
     exitIv: null, priceIv: null, scanIv: null, latIv: null,
     dailyLoss: 0,
     cfg: {
-        positionSize: 5, maxOpen: 30, tpMultiplier: 2, slPercent: 20,
-        timeExit: 30, minLiquidity: 2, maxMcap: 2000000, minMcap: 10000,
-        maxPriority: .001, maxDailyLoss: 50, reserveFloor: .0005,
-        slippage: 1.5, maxAge: 60, maxHolder: 30, minVolSpike: 3,
+        positionSize: 3, maxOpen: 40, tpMultiplier: 2, slPercent: 20,
+        timeExit: 30, minLiquidity: 0.5, maxMcap: 5000000, minMcap: 5000,
+        maxPriority: .00005, maxDailyLoss: 50, reserveFloor: .0001,
+        slippage: 2, maxAge: 120, maxHolder: 50, minVolSpike: 2,
         heliusKey: '', customRpc: '',
     },
 };
@@ -360,7 +360,7 @@ const G = {
 const DFLT = {
     positionSize: 5, maxOpen: 30, tpMultiplier: 2, slPercent: 20,
     timeExit: 30, minLiquidity: 2, maxMcap: 2000000, minMcap: 10000,
-    maxPriority: .001, maxDailyLoss: 50, reserveFloor: .0005,
+    maxPriority: .001, maxDailyLoss: 50, reserveFloor: .00001,  // MICRO WALLETS: 10 lamports
     slippage: 1.5, maxAge: 60, maxHolder: 30, minVolSpike: 3,
 };
 
@@ -680,29 +680,63 @@ async function evalEntry(t) {
 async function execTrade(t) {
     const c=G.cfg;
     try {
-        const posSol = G.balance * (c.positionSize/100);
-        if(posSol < 0.0001) { log('Position too small','warning'); return; }
-        if(G.balance < c.reserveFloor) { log('Below reserve floor','warning'); return; }
-        if(G.openPositions.reduce((a,p)=>a+p.entrySol,0)+posSol > G.balance*(c.maxOpen/100)) { log('Max open hit','warning'); return; }
+        // DEBUG: Show actual balance on first attempt
+        if(!G.openPositions.length && !G.tradeHistory.length && G.logs.filter(l=>l.msg.includes('Balance:')).length<1) {
+            log(`Balance: ${fmt(G.balance, 12)} SOL (${(G.balance*LAMPORTS_PER_SOL).toFixed(0)} lamports)`, 'info');
+        }
         
-        const pFee = Math.min(0.0001, c.maxPriority);
-        const rFee = G.openPositions.find(p=>p.tokenAddress===t.address) ? 0 : RENT_FEE;
-        const net = posSol - NETWORK_FEE - pFee - rFee;
-        if(net <= 0.00001) { log('Net too small','warning'); return; }
+        // For SMALL WALLETS: use most of balance
+        let posPercent = c.positionSize;
+        if(G.balance < 0.01) posPercent = 99;      // < 0.01 SOL: use 99%
+        else if(G.balance < 0.05) posPercent = 95;  // < 0.05 SOL: use 95%
+        else if(G.balance < 0.1) posPercent = 90;   // < 0.1 SOL: use 90%
+        
+        let posSol = G.balance * (posPercent/100);
+        
+        // Reduce fees for tiny wallets
+        let pFee = 0.00005;  // Priority fee
+        let rFee = 0.001;    // Rent fee estimate
+        if(G.balance < 0.01) { 
+            pFee = 0.000001;  // Almost nothing for micro trades
+            rFee = 0.0005;    // Reduced rent estimate
+        }
+        
+        const totalFees = NETWORK_FEE + pFee + rFee;
+        const net = posSol - totalFees;
+        
+        // If net is negative, use remaining balance minus fees
+        if(net <= 0.00001) {
+            posSol = Math.max(0, G.balance - totalFees - 0.000001);
+            if(posSol <= 0) {
+                log(`❌ Insufficient balance: ${fmt(G.balance,12)} SOL (need >${fmt(totalFees+0.000001,12)} SOL for any trade)`, 'error');
+                return;
+            }
+        }
+        
+        if(G.balance < c.reserveFloor) { log('Below reserve floor','warning'); return; }
+        const open = G.openPositions.reduce((a,p)=>a+p.entrySol,0);
+        if(open+posSol > G.balance*(c.maxOpen/100)) { log('Max open hit','warning'); return; }
+        
+        const finalNet = posSol - totalFees;
+        if(finalNet <= 0.000001) { 
+            log(`❌ Net = ${fmt(finalNet,12)} SOL (trade too small)`, 'error'); 
+            return; 
+        }
+        log(`📊 Trade size: ${fmt(posSol,8)} SOL - fees ${fmt(totalFees,8)} = ${fmt(finalNet,8)} SOL`, 'info');
 
-        log(`💬 Quoting: ${fmt(net,6)} SOL → ${t.symbol}…`,'info');
-        const quote = await jupBuyQuote(t.address, net);
+        log(`💬 Quoting: ${fmt(finalNet,6)} SOL → ${t.symbol}…`,'info');
+        const quote = await jupBuyQuote(t.address, finalNet);
         if(!quote?.outAmount) { log('No route','error'); return; }
 
         const tokenAmt = parseInt(quote.outAmount);
         const priceUsd = t.priceUsd ?? 0;
-        const priceSol = net / (tokenAmt/1e9 || 1);
+        const priceSol = finalNet / (tokenAmt/1e9 || 1);
 
         const sig = await doSwap(quote);
         if(!sig) return;
 
         G.openPositions.push({
-            symbol:t.symbol, tokenAddress:t.address, entrySol:posSol, netSol:net, tokenAmount:tokenAmt,
+            symbol:t.symbol, tokenAddress:t.address, entrySol:posSol, netSol:finalNet, tokenAmount:tokenAmt,
             entryPriceSol:priceSol, entryPriceUsd:priceUsd, currentPrice:priceUsd,
             takeProfitPrice:priceUsd*c.tpMultiplier, stopLossPrice:priceUsd*(1-c.slPercent/100),
             networkFee:NETWORK_FEE, priorityFee:pFee, rentFee:rFee,
