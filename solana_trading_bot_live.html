@@ -4,6 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Solana Trading Bot — Real Mainnet v4.1 FIXED</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <style>
         *{margin:0;padding:0;box-sizing:border-box;}
@@ -13,7 +16,7 @@
             --teal:#00d4c8;--teal2:#009e96;--green:#00cc80;
             --red:#ff4040;--warn:#ffaa00;--mono:'Monaco','Courier New',monospace;
         }
-        html,body{width:100%;height:100%;background:var(--bg0);color:var(--t1);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px;line-height:1.5;}
+        html,body{width:100%;height:100%;background:var(--bg0);color:var(--t1);font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:13px;line-height:1.5;}
         body{display:flex;flex-direction:column;}
         .hdr{height:52px;background:var(--bg1);border-bottom:1px solid var(--bd);display:flex;align-items:center;padding:0 18px;gap:18px;flex-shrink:0;}
         .hdr-title{font-weight:700;font-size:13px;letter-spacing:.6px;color:var(--teal);}
@@ -288,6 +291,7 @@
                         <div class="fgrp"><div class="flbl">Max Open Positions (%)</div><input class="finp" type="number" id="cfg-maxOpen" step="1" min="1" max="100"></div>
                         <div class="fgrp"><div class="flbl">Take Profit (X)</div><input class="finp" type="number" id="cfg-tpMultiplier" step="0.1" min="1"></div>
                         <div class="fgrp"><div class="flbl">Stop Loss (%)</div><input class="finp" type="number" id="cfg-slPercent" step="1" min="1" max="100"></div>
+                        <div class="fgrp"><div class="flbl">Slippage (%)</div><input class="finp" type="number" id="cfg-slippage" step="0.1" min="0.1" max="100"></div>
                     </div>
                     <div class="sec-div">Risk Management</div>
                     <div class="frow">
@@ -756,50 +760,78 @@ async function doSwap(quoteResp) {
 // ── REAL DEXSCREENER TOKEN DISCOVERY ───────────────────────────
 async function startScan() {
     log('🔍 Live token scanner started (DexScreener)…','info');
+    let scanning = false;
     const poll = async () => {
         if(G.status!=='running') return;
+        if(scanning) return;
+        scanning = true;
         try {
             const r = await fetchWithTimeout(DS_NEW, {headers:{Accept:'application/json'}});
-            if(!r.ok) { log('⚠ DexScreener unavailable','warning'); return; }
+            if(!r.ok) { log('⚠ DexScreener unavailable','warning'); scanning = false; return; }
             const data = await r.json();
             const items = (Array.isArray(data)?data:[]).filter(t=>t.chainId==='solana'&&t.tokenAddress);
             
-            if(items.length === 0) return;
+            if(items.length === 0) { scanning = false; return; }
             
-            for(const t of items.slice(0,15)) {
-                if(G.tokens.find(x=>x.address===t.tokenAddress)) continue;
+            // Filter only new tokens we haven't processed yet
+            const newItems = [];
+            for (const t of items) {
+                if (G.tokens.find(x => x.address === t.tokenAddress)) continue;
+                newItems.push(t);
+                if (newItems.length >= 15) break;
+            }
+            
+            if (newItems.length === 0) { scanning = false; return; }
+            
+            // Fetch all token pair profiles in a single, batch request
+            const addrs = newItems.map(t => t.tokenAddress).join(',');
+            const pr = await fetchWithTimeout(DS_PAIRS + addrs, {headers:{Accept:'application/json'}});
+            
+            if(pr.ok) {
+                const res = await pr.json();
+                const pairs = res?.pairs ?? [];
                 
-                let pd = null;
-                try {
-                    const pr = await fetchWithTimeout(DS_PAIRS+t.tokenAddress, {headers:{Accept:'application/json'}});
-                    if(pr.ok) pd = (await pr.json())?.pairs?.[0] ?? null;
-                } catch(_){}
+                // Map token addresses to their primary pair (highest liquidity)
+                const pairMap = {};
+                for (const p of pairs) {
+                    if (p.baseToken?.address) {
+                        const addr = p.baseToken.address;
+                        const liq = parseFloat(p.liquidity?.usd ?? 0);
+                        if (!pairMap[addr] || liq > parseFloat(pairMap[addr].liquidity?.usd ?? 0)) {
+                            pairMap[addr] = p;
+                        }
+                    }
+                }
                 
-                if (!pd) continue;
-                
-                const liq = parseFloat(pd?.liquidity?.usd??0)/150 || 0;
-                const mcap = parseFloat(pd?.marketCap ?? pd?.fdv ?? 0);
-                const v5m = parseFloat(pd?.volume?.m5??0);
-                const v1h = parseFloat(pd?.volume?.h1??0.1)||0.1;
-                const age = pd?.pairCreatedAt ? (Date.now()-pd.pairCreatedAt)/60000 : 0;
-                const price = parseFloat(pd?.priceUsd??0);
-                
-                const tok = {
-                    symbol: (t.description||pd?.baseToken?.symbol||'???').slice(0,14),
-                    name: pd?.baseToken?.name??'',
-                    address: t.tokenAddress,
-                    decimals: pd?.baseToken?.decimals ?? 9,
-                    age, liquidity: liq, mcap, volume5m: v5m, avgVolume1m: v1h/60,
-                    priceUsd: price,
-                    signal: sigStrength(liq,mcap,v5m,v1h/60),
-                    discoveredAt: Date.now(),
-                };
-                G.tokens.unshift(tok);
-                if(G.tokens.length>200) G.tokens.pop();
-                if(G.status==='running') evalEntry(tok);
+                for(const t of newItems) {
+                    const pd = pairMap[t.tokenAddress];
+                    if (!pd) continue;
+                    
+                    const liq = parseFloat(pd?.liquidity?.usd??0)/150 || 0; // SOL representation
+                    const mcap = parseFloat(pd?.marketCap ?? pd?.fdv ?? 0);
+                    const v5m = parseFloat(pd?.volume?.m5??0);
+                    const v1h = parseFloat(pd?.volume?.h1??0.1)||0.1;
+                    const age = pd?.pairCreatedAt ? (Date.now()-pd.pairCreatedAt)/60000 : 0;
+                    const price = parseFloat(pd?.priceUsd??0);
+                    
+                    const tok = {
+                        symbol: (t.description||pd?.baseToken?.symbol||'???').slice(0,14),
+                        name: pd?.baseToken?.name??'',
+                        address: t.tokenAddress,
+                        decimals: pd?.baseToken?.decimals ?? 9,
+                        age, liquidity: liq, mcap, volume5m: v5m, avgVolume1m: v1h/60,
+                        priceUsd: price,
+                        signal: sigStrength(liq,mcap,v5m,v1h/60),
+                        discoveredAt: Date.now(),
+                    };
+                    G.tokens.unshift(tok);
+                    if(G.tokens.length>200) G.tokens.pop();
+                    if(G.status==='running') evalEntry(tok);
+                }
             }
             renderFeed();
         } catch(e){ log('❌ Scan error: '+e.message,'error'); }
+        scanning = false;
     };
     poll();
     G.scanIv=setInterval(poll, 8000);
@@ -889,24 +921,28 @@ async function closePosAt(idx, reason, overPx) {
     log(`📊 Closing ${pos.symbol} — ${reason}`,'info');
     
     let sig = null;
+    let exitSol = 0;
     const q = await jupSellQuote(pos.tokenAddress, pos.tokenAmount);
     if(q) {
         sig = await doSwap(q);
         if(!sig) { log('Sell failed','error'); return; }
+        // Exact SOL output from the Jupiter swap quote (converted from lamports)
+        exitSol = parseInt(q.outAmount) / LAMPORTS_PER_SOL;
+    } else {
+        log('❌ Could not fetch exit quote from Jupiter','error');
+        return;
     }
     
-    const exitPx = overPx ?? pos.currentPrice ?? pos.entryPriceUsd;
-    const tokenUnits = pos.tokenAmount / Math.pow(10, pos.decimals || 9);
-    const pnl = (exitPx - pos.entryPriceUsd) * tokenUnits;
+    const pnl = exitSol - pos.entrySol;
     
     G.tradeHistory.push({
         symbol:pos.symbol, tokenAddress:pos.tokenAddress,
-        entryPriceSol:pos.entryPriceSol, exitPriceSol:exitPx,
+        entryPriceSol:pos.entryPriceSol, exitPriceSol: exitSol / (pos.tokenAmount / Math.pow(10, pos.decimals || 9)),
         entryTime:pos.entryTime, exitTime:Date.now(),
         netPnl:pnl, exitReason:reason,
         entrySignature:pos.entrySignature, exitSignature:sig,
     });
-    G.balance += pos.entrySol + pnl;
+    G.balance += exitSol;
     if(pnl<0) G.dailyLoss += Math.abs(pnl);
     G.openPositions.splice(idx,1);
     
@@ -930,30 +966,47 @@ function startMonitor() {
 async function refreshPrices() {
     if (G.openPositions.length === 0) return;
     
-    for(const pos of G.openPositions) {
-        try {
-            // Check cache first
-            const now = Date.now();
-            if (G.priceCache[pos.tokenAddress] && (now - (G.lastPriceUpdate[pos.tokenAddress] || 0)) < 5000) {
-                pos.currentPrice = G.priceCache[pos.tokenAddress];
-                pos.unrealizedPnl=(pos.currentPrice-pos.entryPriceUsd)*(pos.tokenAmount/(Math.pow(10, pos.decimals || 9)));
-                continue;
+    const addrs = G.openPositions.map(p => p.tokenAddress).join(',');
+    const now = Date.now();
+    
+    try {
+        const p = await fetchWithTimeout(DS_PAIRS + addrs, {
+            headers:{accept:'application/json'}
+        });
+        if(p.ok) {
+            const d = await p.json();
+            const pairs = d?.pairs ?? [];
+            
+            // Map token addresses to their primary pairs
+            const priceMap = {};
+            for (const pair of pairs) {
+                if (pair.baseToken?.address) {
+                    const addr = pair.baseToken.address;
+                    if (!priceMap[addr] || (pair.liquidity?.usd ?? 0) > (priceMap[addr].liquidity?.usd ?? 0)) {
+                        priceMap[addr] = pair;
+                    }
+                }
             }
             
-            const p = await fetchWithTimeout(BIRDEYE_PRICE+pos.tokenAddress+'&x-chain=solana', {
-                headers:{accept:'application/json'}
-            });
-            if(p.ok) {
-                const d = await p.json();
-                const price = d?.data?.value;
+            for(const pos of G.openPositions) {
+                const pair = priceMap[pos.tokenAddress];
+                const price = parseFloat(pair?.priceUsd??0);
                 if(price > 0) {
                     pos.currentPrice = price;
-                    pos.unrealizedPnl = (price - pos.entryPriceUsd) * (pos.tokenAmount / Math.pow(10, pos.decimals || 9));
+                    
+                    // Mathematical Conversion of USD P&L to SOL
+                    const tokenUnits = pos.tokenAmount / Math.pow(10, pos.decimals || 9);
+                    const pnlUsd = (price - pos.entryPriceUsd) * tokenUnits;
+                    const solPriceInUsd = pos.entryPriceUsd / pos.entryPriceSol;
+                    pos.unrealizedPnl = pnlUsd / (solPriceInUsd || 1);
+                    
                     G.priceCache[pos.tokenAddress] = price;
                     G.lastPriceUpdate[pos.tokenAddress] = now;
                 }
             }
-        } catch(_){}
+        }
+    } catch(e) {
+        log('❌ Price refresh error: '+e.message, 'warning');
     }
     renderPositions(); renderPortfolio(); updateHeader(); renderChart();
 }
@@ -1107,6 +1160,8 @@ document.getElementById('fc-calc').addEventListener('click',()=>{
 
 function loadCfgUI() {
     for(const k of Object.keys(DFLT)){ const e=document.getElementById('cfg-'+k); if(e) e.value=G.cfg[k]; }
+    const h=document.getElementById('cfg-helius'); if(h) h.value=G.cfg.heliusKey||'';
+    const r=document.getElementById('cfg-rpc'); if(r) r.value=G.cfg.customRpc||'';
 }
 
 document.getElementById('s-save').addEventListener('click',()=>{
@@ -1119,7 +1174,7 @@ document.getElementById('s-save').addEventListener('click',()=>{
 });
 
 document.getElementById('s-reset').addEventListener('click',()=>{
-    G.cfg={...DFLT}; 
+    G.cfg={...DFLT, heliusKey: '', customRpc: ''}; 
     loadCfgUI();
     localStorage.removeItem('solbot_config');
     log('↻ Settings reset to defaults','info');
@@ -1127,7 +1182,9 @@ document.getElementById('s-reset').addEventListener('click',()=>{
 
 document.getElementById('start-btn').addEventListener('click',()=>{
     if(!G.connected){ log('Connect wallet first','warning'); return; }
-    G.status='running'; updateStatusUI(); startMonitor(); startScan();
+    G.status='running'; updateStatusUI();
+    clearAllIntervals(); // Clean up existing intervals before starting new ones
+    startMonitor(); startScan();
     G.priceIv=setInterval(refreshPrices, 3000); // More frequent price updates
     G._intervals = [...(G._intervals || []), G.priceIv];
     log('🚀 Bot started — REAL MAINNET TRADING','success');
